@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -172,10 +173,15 @@ func (dr *OnegetDownloader) getProjectReleases(config DownloadConfig) ([]*Projec
 	}
 	defer resp.Body.Close()
 
-	releases, err := dr.parser.ParseProjectReleases(resp.Body)
+	body, err := readBody(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	releases, err := dr.parser.ParseProjectReleases(bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("error parse project <%s> releases: %s, html: <%s>",
-			config.Project, err.Error(), readBodyMustString(resp.Body))
+			config.Project, err.Error(), string(body))
 	}
 
 	return filterProjectVersionInfo(releases, config.Version), nil

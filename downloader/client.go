@@ -2,14 +2,15 @@ package downloader
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"strings"
 	"sync"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/khorevaa/logos"
 )
 
@@ -19,8 +20,9 @@ var loginURL = "https://login.1c.ru"
 var log = logos.New("github.com/v8platform/oneget/downloader").Sugar()
 
 const (
-	projectHrefPrefix = "/project/"
-	tempFileSuffix    = ".d1c"
+	projectHrefPrefix    = "/project/"
+	tempFileSuffix       = ".d1c"
+	casSecurityCheckPath = "/public/security_check"
 )
 
 func NewClient(loginUrl string, baseUrl string, login string, password string) (*Client, error) {
@@ -35,16 +37,9 @@ func NewClient(loginUrl string, baseUrl string, login string, password string) (
 		cookie:   cj,
 	}
 
-	url, err := c.getAuthTicketURL(baseUrl)
-	if err != nil {
+	if err := c.authenticate(); err != nil {
 		return nil, err
 	}
-
-	loginResp, err := c.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer loginResp.Body.Close()
 
 	return c, nil
 }
@@ -57,74 +52,73 @@ type Client struct {
 	baseUrl  string
 }
 
-func (c *Client) getAuthTicketURL(url string) (string, error) {
+// authenticate performs the Apereo CAS login flow used by login.1c.ru: fetch the
+// login form issued for the releases.1c.ru service, submit credentials together
+// with the form's one-time "execution" flow token, and follow the resulting
+// service-ticket redirect back into releases.1c.ru. A successful run leaves the
+// client's cookie jar holding an authenticated releases.1c.ru session.
+func (c *Client) authenticate() error {
 
-	type loginParams struct {
-		Login       string `json:"login"`
-		Password    string `json:"password"`
-		ServiceNick string `json:"serviceNick"`
-	}
+	service := c.baseUrl + casSecurityCheckPath
+	loginPageURL := c.loginUrl + "/login?" + url.Values{"service": {service}}.Encode()
 
-	type ticket struct {
-		Ticket string `json:"ticket"`
-	}
-
-	ticketUrl := c.loginUrl + "/rest/public/ticket/get"
-	postBody, err := json.Marshal(
-		loginParams{c.login, c.password, url})
+	req, err := http.NewRequest("GET", loginPageURL, nil)
 	if err != nil {
-		return "", err
+		return err
 	}
 
-	buf := bytes.NewBuffer(postBody)
-	defer put(buf)
-	req, err := http.NewRequest("POST", ticketUrl, buf)
-
-	if err != nil {
-		return "", err
-	}
-
-	req.SetBasicAuth(c.login, c.password)
-	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.doRequest(req)
-
 	if err != nil {
-		return "", err
+		return err
 	}
-
 	defer resp.Body.Close()
 
-	switch resp.StatusCode {
-	case http.StatusOK:
-
-		var ticketData ticket
-		err := bodyToJSON(resp.Body, &ticketData)
-		if err != nil {
-			return "", err
-		}
-
-		return fmt.Sprintf(loginURL+"/ticket/auth?token=%s", ticketData.Ticket), nil
-
-	default:
-
-		type ErrorRespond struct {
-			Timestamp string `json:"timestamp"`
-			Status    int    `json:"status"`
-			Error     string `json:"error"`
-			Exception string `json:"exception"`
-			Message   string `json:"message"`
-			Path      string `json:"path"`
-		}
-
-		var errData ErrorRespond
-
-		err := bodyToJSON(resp.Body, &errData)
-		if err != nil {
-			return "", err
-		}
-
-		return "", fmt.Errorf("%s: %s", errData.Error, errData.Message)
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return fmt.Errorf("error parse CAS login page: %s", err.Error())
 	}
+
+	execution, ok := doc.Find(`input[name="execution"]`).Attr("value")
+	if !ok || execution == "" {
+		return fmt.Errorf("error parse CAS login page: <execution> token not found")
+	}
+
+	form := url.Values{
+		"username":    {c.login},
+		"password":    {c.password},
+		"execution":   {execution},
+		"_eventId":    {"submit"},
+		"geolocation": {""},
+		"rememberMe":  {"on"},
+	}
+
+	authReq, err := http.NewRequest("POST", c.loginUrl+"/login", strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	authReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	authResp, err := c.doRequest(authReq)
+	if err != nil {
+		return err
+	}
+	defer authResp.Body.Close()
+
+	if c.isLoginPage(authResp) {
+		return fmt.Errorf("CAS authentication failed for user <%s>: check the username/password", c.login)
+	}
+
+	return nil
+}
+
+// isLoginPage reports whether a (possibly redirect-followed) response ended up
+// back on login.1c.ru's login form, which is how an expired/missing releases.1c.ru
+// session shows up: the site responds with a 302 to CAS and CAS renders the form
+// with a fresh 200, rather than an HTTP 401.
+func (c *Client) isLoginPage(resp *http.Response) bool {
+	return resp.Request != nil &&
+		strings.Contains(resp.Request.URL.Host, "login.") &&
+		strings.HasPrefix(resp.Request.URL.Path, "/login")
 }
 
 func (c *Client) Get(getUrl string) (*http.Response, error) {
@@ -134,38 +128,31 @@ func (c *Client) Get(getUrl string) (*http.Response, error) {
 		getUrl = c.baseUrl + getUrl
 	}
 
-	req, err := http.NewRequest("GET", getUrl, nil)
-
+	resp, err := c.getOnce(getUrl)
 	if err != nil {
 		return nil, err
 	}
 
-	req.SetBasicAuth(c.login, c.password)
+	if c.isLoginPage(resp) {
+		resp.Body.Close()
+		log.Debugf("Session expired, re-authenticating for url: %s", getUrl)
 
-	resp, err := c.doRequest(req)
+		if err := c.authenticate(); err != nil {
+			return nil, err
+		}
 
-	if err != nil {
-		return nil, err
+		resp, err = c.getOnce(getUrl)
+		if err != nil {
+			return nil, err
+		}
+
+		if c.isLoginPage(resp) {
+			resp.Body.Close()
+			return nil, fmt.Errorf("still redirected to CAS login after re-authentication, url: %s", getUrl)
+		}
 	}
 
 	switch resp.StatusCode {
-	case http.StatusUnauthorized:
-		log.Debugf("Re-authorized with ticket url: %s", getUrl)
-		url, err := c.getAuthTicketURL(getUrl)
-		if err != nil {
-			return nil, err
-		}
-
-		req, err := http.NewRequest("GET", url, nil)
-
-		if err != nil {
-			return nil, err
-		}
-
-		req.SetBasicAuth(c.login, c.password)
-
-		return c.doRequest(req)
-
 	case http.StatusBadRequest, http.StatusNotFound:
 
 		return nil, fmt.Errorf("respose CODE:%d  ERR:%s",
@@ -176,6 +163,16 @@ func (c *Client) Get(getUrl string) (*http.Response, error) {
 		return resp, fmt.Errorf("unknown respose CODE: <%d>", resp.StatusCode)
 	}
 
+}
+
+func (c *Client) getOnce(getUrl string) (*http.Response, error) {
+
+	req, err := http.NewRequest("GET", getUrl, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.doRequest(req)
 }
 
 func (c *Client) client() *http.Client {
@@ -189,15 +186,6 @@ func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
 
 	return c.client().Do(req)
 
-}
-
-func bodyToJSON(body io.ReadCloser, into interface{}) error {
-	b, err := readBody(body)
-	if err != nil {
-		return err
-	}
-
-	return json.Unmarshal(b, into)
 }
 
 func readBody(body io.ReadCloser) ([]byte, error) {
