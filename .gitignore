@@ -6,6 +6,7 @@ oneget
 logs
 downloads
 dist
+/Release
 .idea
 *.logs
 
